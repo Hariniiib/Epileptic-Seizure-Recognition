@@ -1,0 +1,517 @@
+VIVA PREPARATION GUIDE - EPILEPTIC SEIZURE RECOGNITION
+=======================================================
+
+
+PART 1: CODE BLOCK-BY-BLOCK EXPLANATION (codetrial3.ipynb)
+==========================================================
+
+
+Code Block 1 - Importing Libraries
+------------------------------------
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import cv2
+from scipy import signal
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, MaxPooling1D, LSTM, Bidirectional, Dense, Dropout, Concatenate, GlobalAveragePooling1D, GlobalAveragePooling2D, BatchNormalization, Activation
+from tensorflow.keras.applications import VGG16, ResNet50
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+What it does: Loads all the tools the project needs.
+
+Library         Purpose
+-------         -------
+NumPy           Mathematical operations on arrays
+Pandas          Loading and manipulating the CSV dataset
+Matplotlib      Plotting graphs (accuracy, loss curves)
+Seaborn         Plotting confusion matrix heatmaps
+OpenCV (cv2)    Resizing spectrogram images
+SciPy           Generating spectrograms from 1D signals
+Scikit-learn    Data splitting, normalization, evaluation metrics
+TensorFlow      Building, training, and running the deep learning model
+Keras           High-level API for TensorFlow
+VGG16           Pre-trained CNN for spatial feature extraction
+ResNet50        Pre-trained CNN with skip connections
+
+
+Code Block 2 - Loading and Preparing the Dataset
+--------------------------------------------------
+
+df = pd.read_csv("Epileptic Seizure Recognition.csv")
+df = df.drop(columns=['Unnamed'], errors='ignore')
+X_raw = df.drop(columns=['y']).values
+y_raw = df['y'].values
+y_encoded = y_raw - 1
+y_categorical = tf.keras.utils.to_categorical(y_encoded, num_classes=5)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_raw)
+
+What it does, step by step:
+
+1. Loads the CSV - 11,500 rows x 179 columns (178 EEG features + 1 label column y)
+2. Drops the Unnamed column - removes the index column if it exists
+3. Separates features and labels - X_raw = 178 EEG values, y_raw = class labels (1-5)
+4. Encodes labels to 0-4 - Neural networks expect classes to start from 0, not 1
+5. One-hot encoding - Converts label 3 into [0, 0, 1, 0, 0] (a vector of 5 values). This is needed because Softmax outputs 5 probabilities.
+6. Z-Score Normalization - Converts wild EEG amplitudes (like -500, 1200) into standardized values around 0
+
+Viva Q and A:
+Q: Why one-hot encode?
+A: Because Softmax outputs a probability for each class. The loss function (Categorical Cross-Entropy) compares the predicted probability vector against the true one-hot vector.
+
+Q: Why normalize?
+A: Without normalization, features with larger magnitudes dominate training, causing poor convergence and biased learning.
+
+
+Code Block 3 - Converting 1D Signals to 2D Spectrograms
+---------------------------------------------------------
+
+def convert_to_scalograms(X_data, img_size=64):
+    frequencies, times, Sxx = signal.spectrogram(X_data[i], fs=178, nperseg=64, noverlap=32)
+    Sxx_log = 10 * np.log10(Sxx + 1e-10)
+    Sxx_norm = (Sxx_log - Sxx_log.min()) / (Sxx_log.max() - Sxx_log.min()) * 255.0
+    resized_img = cv2.resize(Sxx_norm, (64, 64))
+    rgb_img = cv2.cvtColor(resized_img, cv2.COLOR_GRAY2RGB)
+
+What it does in simple words:
+
+1. Takes each 1D EEG signal (178 numbers in a line)
+2. Applies Short-Time Fourier Transform (STFT) to break it into frequency components over time
+3. Creates a 2D spectrogram - a heat map showing which frequencies are active at which time
+4. Applies log scaling (decibels) - this amplifies weak signals that would otherwise be invisible
+5. Resizes to 64x64 pixels and converts to RGB (3 channels) - because VGG16 and ResNet50 expect color images
+
+Analogy: Think of it like converting a song (1D audio wave) into a visual music sheet (2D image showing notes over time). The CNN can then "see" seizure patterns instead of "reading" numbers.
+
+Why 64x64? Smaller images = fewer parameters = faster training and less overfitting. The textures (energy patterns) are still preserved.
+
+
+Code Block 4 - Splitting the Data
+-----------------------------------
+
+idx_temp, idx_test = train_test_split(..., test_size=0.10, stratify=y_categorical)
+idx_train, idx_val = train_test_split(idx_temp, test_size=0.1111, stratify=y_temp)
+
+What it does:
+Splits 11,500 samples into:
+  Training:   80% (9,200 samples) - Model learns from this
+  Validation: 10% (1,150 samples) - Model checks itself during training
+  Test:       10% (1,150 samples) - Final unseen evaluation
+
+Key word "stratify": Ensures each split has the same class distribution (20% per class). Without this, one split could have all seizure samples and another could have none.
+
+Q: Why 3 splits instead of 2?
+A: Training = learning, Validation = tuning (early stopping watches this), Test = final exam (never seen during training).
+
+Q: Why not 70/15/15?
+A: 80/10/10 gives the model maximum training data for better learning while still having enough validation/test samples (1,150 each).
+
+
+Code Block 5 - Building the Hybrid Model
+------------------------------------------
+
+This is the CORE of the project. Three branches are built and then fused.
+
+BRANCH 1: VGG16 (Frozen)
+
+vgg_base = VGG16(include_top=False, weights='imagenet', input_tensor=img_input)
+vgg_base.trainable = False
+vgg_out = GlobalAveragePooling2D()(vgg_base.output)
+vgg_out = Dense(128, activation='relu', kernel_regularizer=l2(0.01))(vgg_out)
+vgg_out = BatchNormalization()(vgg_out)
+vgg_out = Dropout(0.4)(vgg_out)
+
+What it does:
+1. Loads VGG16 pre-trained on ImageNet (1.2 million natural images)
+2. Freezes all its layers - the pre-learned weights are NOT updated during training
+3. VGG16 acts as a fixed feature extractor - it recognizes edges, textures, and patterns in the spectrograms
+4. GlobalAveragePooling2D - Collapses the 2D feature maps into a 1D vector
+5. Dense(128) - A fully connected layer that reduces the features to 128 values
+6. BatchNormalization - Normalizes outputs to prevent internal covariate shift
+7. Dropout(0.4) - Randomly turns off 40% of neurons during training to prevent overfitting
+
+
+BRANCH 2: ResNet50 (Frozen)
+
+Same idea as VGG16, but ResNet50 uses skip connections (residual learning). This means it can learn deeper features without the vanishing gradient problem.
+
+
+BRANCH 3: 1D-CNN + BiLSTM
+
+Three Conv1D layers with increasing filters:
+x_1d = Conv1D(64, kernel_size=5, padding='same')(seq_input)    -> Layer 1
+x_1d = Conv1D(128, kernel_size=3, padding='same')(x_1d)        -> Layer 2
+x_1d = Conv1D(256, kernel_size=3, padding='same')(x_1d)        -> Layer 3
+
+Two stacked BiLSTM layers:
+x_1d = Bidirectional(LSTM(128, return_sequences=True))(x_1d)   -> Layer 1
+x_1d = Bidirectional(LSTM(128, return_sequences=False))(x_1d)  -> Layer 2
+
+What it does:
+1. Conv1D layers (64 to 128 to 256 filters) slide small windows across the 178-point EEG signal to detect local patterns (spikes, dips, sharp waves)
+2. BiLSTM layers read the signal both forward (past to future) and backward (future to past), so each point knows its full context
+3. Each Conv1D has BatchNorm + ReLU + MaxPooling after it
+
+
+FEATURE FUSION:
+
+merged = Concatenate()([vgg_out, resnet_out, x_1d])
+dense = Dense(512, activation='relu')(merged)
+dense = Dense(256, activation='relu')(dense)
+output = Dense(5, activation='softmax')(dense)
+
+What it does:
+1. Concatenates all three feature vectors into one long vector
+2. Passes through two Dense layers (512 to 256) to find complex combinations
+3. Final Softmax layer outputs 5 probabilities (one per class), all summing to 1.0
+
+
+Code Block 6 - Training the Model
+------------------------------------
+
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=6, min_lr=1e-6)
+]
+history = model.fit(x=[X_seq_train, X_img_train], y=y_train,
+                    validation_data=([X_seq_val, X_img_val], y_val),
+                    epochs=100, batch_size=64, callbacks=callbacks)
+
+What it does:
+1. Trains for up to 100 epochs (full passes through the training data)
+2. EarlyStopping - If validation loss does not improve for 20 consecutive epochs, training stops and the best weights are restored
+3. ReduceLROnPlateau - If validation loss stalls for 6 epochs, the learning rate is halved (from 0.0003 to 0.00015 to 0.000075 and so on)
+4. Batch size 64 - Each training step uses 64 samples at once (not all 9,200), making gradients more stable
+
+
+Code Block 7 - Evaluation
+---------------------------
+
+predictions = model.predict([X_seq_test, X_img_test])
+y_pred_classes = np.argmax(predictions, axis=1)
+print(classification_report(y_true_classes, y_pred_classes))
+
+What it does:
+1. Makes predictions on the 1,150 test samples (never seen during training)
+2. argmax - Picks the class with the highest probability
+3. Prints precision, recall, F1-score per class
+4. Generates confusion matrix and comparative table
+
+
+
+PART 2: WHAT HAPPENS WHEN A USER UPLOADS DATA (FLASK)
+=======================================================
+
+Step-by-Step Internal Flow:
+
+STEP 1: User clicks Upload on prediction.html
+         |
+STEP 2: Flask receives the .xlsx file
+         file = request.files.get("file")
+         |
+STEP 3: VALIDATION CHECK
+         - Is it a .xlsx file? Yes or No
+         - Does it have exactly 178 columns?
+           if df.shape[1] != 178:
+               return "Error: Must have 178 EEG features"
+         |
+STEP 4: PREPROCESSING
+         X = scaler.transform(df.values)
+         (uses the SAME mean/std from training, loaded from scaler.pkl)
+         X = X.reshape(X.shape[0], 178, 1)
+         (reshapes for Conv1D input)
+         |
+STEP 5: PREDICTION
+         preds = model.predict(X)
+         Example output: [0.98, 0.01, 0.00, 0.01, 0.00]
+         pred_class = argmax + 1 = 1
+         label = "Seizure Activity"
+         |
+STEP 6: STORE AND DISPLAY
+         - Saves prediction to SQLite database
+         - Renders prediction.html with result = "Seizure Activity"
+
+
+How Incorrect Data Is Handled:
+
+Check                   Code                                    What Happens
+-----                   ----                                    ------------
+Wrong file type         if file.filename.endswith(".xlsx")       Only .xlsx files accepted. Other formats are silently rejected.
+Wrong column count      if df.shape[1] != 178                   Returns error message: File must contain exactly 178 EEG features
+Extra columns           df.drop(columns=["Unnamed","y"])        Automatically removes index/label columns if present
+No file uploaded        file = request.files.get("file")        Returns None, no prediction is made
+Not logged in           if "user" not in session                Redirects to login page
+
+
+
+PART 3: KEY CONCEPTS EXPLAINED
+================================
+
+
+What is Bias?
+--------------
+
+In a neural network, each neuron computes:
+
+   output = (weight1 x input1) + (weight2 x input2) + ... + bias
+
+Bias is an extra number added to the weighted sum. Think of it as the neuron's "baseline tendency."
+
+Analogy: Imagine predicting house prices.
+- Weights = "how much does each feature matter" (size, location, age)
+- Bias = "the base price of any house, regardless of features" (e.g., 10 lakh minimum)
+
+Without bias, the output would always be zero when all inputs are zero. Bias gives the neuron flexibility to shift its activation threshold.
+
+
+What is Adam Optimizer?
+------------------------
+
+Adam = Adaptive Moment Estimation
+
+After each training batch, the model needs to update its weights to reduce the error. The optimizer decides HOW MUCH to change each weight.
+
+Simple analogy: Imagine you are walking down a mountain (loss landscape) blindfolded:
+- SGD (basic): Take equal-sized steps downhill. Slow, might miss the valley.
+- Adam: Keeps track of two things:
+  1. Momentum (1st moment) - "Which direction have I been going recently?" (prevents zigzagging)
+  2. Adaptive learning rate (2nd moment) - "Is this path steep or flat?" (takes bigger steps on flat areas, smaller steps on steep areas)
+
+Why Adam over SGD?
+- Converges faster
+- Self-adjusting learning rate per parameter
+- Works well with sparse data and noisy gradients
+
+In the project:
+   optimizer = tf.keras.optimizers.Adam(learning_rate=0.0003)
+
+Starting learning rate = 0.0003 (small enough for stable learning, big enough to make progress)
+
+
+What is a Confusion Matrix?
+-----------------------------
+
+A confusion matrix is a table that shows what the model predicted vs. what was actually true for every class.
+
+For our 5-class problem:
+
+                        PREDICTED CLASS
+                   Seizure  Tumor  Healthy  EyesCl  EyesOp
+ACTUAL  Seizure  [  227      1      0        1       1   ]
+        Tumor    [    2    166     48        5       9   ]
+        Healthy  [    0     47    180        0       3   ]
+        EyesCl   [    1      0      4      195      30   ]
+        EyesOp   [    0      0      5       17     208   ]
+
+- Diagonal (227, 166, 180, 195, 208) = Correct predictions (True Positives)
+- Off-diagonal = Mistakes
+- Reading row-wise: Of the 230 actual seizure samples, 227 were correctly classified
+- Reading column-wise: Of all samples predicted as seizure, how many were actually seizure
+
+Why it matters: Accuracy alone can be misleading. With a confusion matrix you can see WHERE the model fails (e.g., it confuses Tumor and Healthy classes).
+
+
+
+PART 4: ALL FORMULAS FROM THE RESEARCH PAPER
+==============================================
+
+
+Formula 1: 1D Convolution
+---------------------------
+
+   z_i = SUM(k=1 to K) of W_k . x_(i+k-1) + b
+
+Symbol      Meaning
+------      -------
+x           The input EEG signal (178 numbers)
+W           The kernel/filter - a small set of learnable weights (e.g., 5 numbers)
+K           Kernel size (e.g., 5)
+b           Bias - a constant added after multiplication
+z_i         Output at position i
+
+How it works: Imagine sliding a magnifying glass of size 5 across the 178-point signal. At each position, you multiply the 5 signal values by the 5 kernel values, add them up, and add bias. This produces one output number. The kernel learns to detect specific patterns (e.g., a sharp spike = seizure indicator).
+
+Then ReLU is applied: y_i = max(0, z_i)
+
+This means: If the result is negative, make it zero. Otherwise, keep it. This adds non-linearity. Without it, stacking 100 layers would be the same as having 1 layer (just linear math).
+
+
+Formula 2: Forward LSTM Hidden State
+---------------------------------------
+
+   h_forward(t) = sigmoid(W_h . x_t + U_h . h_forward(t-1) + b_h)
+
+Symbol              Meaning
+------              -------
+x_t                 Input at time step t (one of 178 points)
+h_forward(t-1)      The hidden state from the previous time step (memory of past)
+h_forward(t)        The new hidden state at time t
+W                   Weight matrix for the current input
+U                   Weight matrix for the previous hidden state
+b                   Bias
+sigmoid             Activation function that squashes values between 0 and 1
+
+In simple words: At each time step, the LSTM looks at the current EEG value AND its memory of all previous values, then decides what to remember and what to forget. The forward direction means it reads left to right (past to present).
+
+
+Formula 3: Backward LSTM Hidden State
+----------------------------------------
+
+   h_backward(t) = sigmoid(W_h . x_t + U_h . h_backward(t+1) + b_h)
+
+Same as Formula 2, but reads the signal in reverse (right to left, future to present). Notice it uses h(t+1) instead of h(t-1).
+
+Why both directions? A seizure spike at time t might be better understood if you know what comes AFTER it too. The backward pass gives this future context.
+
+
+Formula 4: BiLSTM Concatenation
+---------------------------------
+
+   H_t = [h_forward(t) concatenated with h_backward(t)]
+
+What it means: The forward hidden state and the backward hidden state are joined side by side into one combined vector.
+
+Example:
+- Forward gives:  [0.3, 0.7, 0.1, ...] (128 numbers)
+- Backward gives: [0.5, 0.2, 0.8, ...] (128 numbers)
+- Combined:       [0.3, 0.7, 0.1, ..., 0.5, 0.2, 0.8, ...] (256 numbers)
+
+This combined vector contains both past and future context for every EEG time point.
+
+
+Formula 5: Softmax Classification
+------------------------------------
+
+   P(y=j | Z) = exp(Z_j) / SUM(k=1 to 5) of exp(Z_k)
+
+Symbol      Meaning
+------      -------
+Z           The raw output vector from the last Dense layer (5 numbers, called logits)
+Z_j         The logit for class j
+exp         Exponential function (e raised to the power x) - makes all values positive
+P(y=j)      Probability that the input belongs to class j
+
+Example walkthrough:
+
+Raw logits Z = [4.2, 1.1, 0.5, 0.8, 0.3]
+
+Step 1: exp(Z) = [66.7, 3.0, 1.6, 2.2, 1.3]
+Step 2: Sum    = 66.7 + 3.0 + 1.6 + 2.2 + 1.3 = 74.8
+Step 3: Divide each by sum:
+
+P(Seizure)     = 66.7 / 74.8 = 0.892 (89.2%)    <- Highest
+P(Tumor)       =  3.0 / 74.8 = 0.040 (4.0%)
+P(Healthy)     =  1.6 / 74.8 = 0.021 (2.1%)
+P(Eyes Closed) =  2.2 / 74.8 = 0.029 (2.9%)
+P(Eyes Open)   =  1.3 / 74.8 = 0.017 (1.7%)
+                               -------
+                  Total         1.000 (100%)
+
+The model predicts Class 1 (Seizure) because it has the highest probability.
+
+
+PERFORMANCE METRICS FORMULAS
+------------------------------
+
+Accuracy = (TP + TN) / (TP + TN + FP + FN)
+
+   "Out of ALL predictions, how many were correct?" Answer: 84.87%
+
+
+Precision = TP / (TP + FP)
+
+   "When the model says Seizure, how often is it actually right?"
+   High precision = few false alarms
+   Seizure precision = 0.9870 (98.7% of seizure predictions were correct)
+
+
+Recall (Sensitivity) = TP / (TP + FN)
+
+   "Of all actual seizures in the data, how many did the model catch?"
+   High recall = few missed seizures
+   Seizure recall = 0.9870 (98.7% of real seizures were detected)
+
+
+F1-Score = 2 x (Precision x Recall) / (Precision + Recall)
+
+   "A balanced average of precision and recall."
+   It is the harmonic mean, which punishes cases where one is high and the other is low.
+
+   Example: If precision = 0.99 and recall = 0.50:
+   - Simple average = 0.745 (looks okay)
+   - F1 = 2 x (0.99 x 0.50) / (0.99 + 0.50) = 0.664 (reveals the problem)
+
+
+Categorical Cross-Entropy Loss = -SUM(j=1 to 5) of y_j . log(P_j)
+
+Symbol      Meaning
+------      -------
+y_j         True label (one-hot: 1 for correct class, 0 for others)
+P_j         Predicted probability for class j
+
+Example: True class = Seizure, so y = [1, 0, 0, 0, 0]
+         Predicted = [0.89, 0.04, 0.02, 0.03, 0.02]
+
+   L = -(1 x log(0.89) + 0 + 0 + 0 + 0) = -log(0.89) = 0.117
+
+   If the model had predicted P1 = 0.99, loss = -log(0.99) = 0.01 (much lower = better)
+   If the model had predicted P1 = 0.01, loss = -log(0.01) = 4.6 (very high = bad)
+
+   The optimizer's goal is to minimize this loss.
+
+
+
+PART 5: QUICK VIVA Q AND A CHEAT SHEET
+=========================================
+
+Q: What is transfer learning?
+A: Using a model pre-trained on a large dataset (ImageNet) and applying it to a new problem (EEG classification) instead of training from scratch.
+
+Q: Why freeze VGG16/ResNet50?
+A: To prevent overfitting. These models have millions of parameters. Fine-tuning them on only 9,200 samples would cause the model to memorize training data.
+
+Q: What is Dropout?
+A: During training, randomly sets a percentage (40-50%) of neuron outputs to zero. Forces the network to build redundant paths, improving generalization.
+
+Q: What is BatchNormalization?
+A: Normalizes layer outputs to have mean=0, std=1. This stabilizes training and allows higher learning rates.
+
+Q: What is overfitting?
+A: When the model memorizes training data (99% train accuracy) but fails on new data (60% test accuracy). The train-validation gap is large.
+
+Q: What is Early Stopping?
+A: A callback that monitors validation loss. If it does not improve for 20 epochs, training stops and the best weights are restored. Prevents overfitting.
+
+Q: What is a spectrogram?
+A: A 2D visual representation of a 1D signal showing how frequency content changes over time. X-axis = time, Y-axis = frequency, Color = power/intensity.
+
+Q: Why dual-branch architecture?
+A: Spatial branch (VGG16/ResNet50) captures "what frequencies are present." Temporal branch (CNN-BiLSTM) captures "how the signal changes over time." Together they give a complete picture.
+
+Q: What is L2 regularization?
+A: Adds a penalty term (lambda x W squared) to the loss function, discouraging large weights. This prevents the model from relying too heavily on any single feature.
+
+Q: Why Softmax and not Sigmoid?
+A: Sigmoid is for binary (2 classes). Softmax generalizes to multiple classes. It ensures all 5 probabilities sum to 1.0.
+
+Q: What is the learning rate?
+A: Controls how big each weight update step is. Too high = overshoots the minimum. Too low = takes forever to converge. Adam adapts it automatically per parameter.
+
+Q: What does return_sequences=True mean?
+A: The first BiLSTM outputs a value at every time step (needed as input for the second BiLSTM). The second uses False to output only the final summary vector.
+
+Q: What is the pkl file?
+A: A Pickle file that stores the StandardScaler object (mean and std of 178 features). It is saved during training and loaded during Flask prediction to normalize new data using the exact same statistics.
+
+Q: What is the h5 file?
+A: An HDF5 file that stores the trained model's architecture and all its millions of weight values. Flask loads this file to make predictions without retraining.
+
+Q: How are Flask and Colab connected?
+A: They are NOT connected at runtime. Colab trains the model and exports cnn_model.h5 and scaler.pkl. Flask loads these two files to serve predictions. The connection is through the saved files, not a live link.
